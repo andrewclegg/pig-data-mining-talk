@@ -1,3 +1,6 @@
+Part 1: Finding similar items
+=============================
+
 Getting the files
 -----------------
 
@@ -38,7 +41,7 @@ Preparation
 
     set pig.exec.mapPartAgg true;
 
-    -- Enumrate iterates through a bag and gives each element an index number
+    -- Enumerate iterates through a bag and gives each element an index number
     
     define Enumerate datafu.pig.bags.Enumerate('1');
     
@@ -177,6 +180,8 @@ _Hat tip to Jacob Perkins (@thedatachef) whose blog on doing the same with unipa
         generate flatten(best_hit);
     }
 
+    -- Join the actual songs back on so we can display the results
+
     best_hits_j1 = join song_ids1 by song_id, best_hits by song1_id using 'replicated';
 
     best_hits_j2 = join song_ids2 by song_id, best_hits_j1 by song2_id using 'replicated';
@@ -237,5 +242,155 @@ I called this a naive approach because past a certain point it'll start getting 
 
 For very large data sets, you really need a way of partitioning the search space in such a way that you can do a local search for nearest neighbours instead of a global search. That is, you only need to compare each item to likely candidates for high similarity. 
 
+### TODO
+
+Part 2: Classification
+======================
+
+As a bit of extra fun, here's how to do Naive Bayes in Pig.
+
+_Inspired by a post on the Nuncupative blog about doing this in SQL:_
+
+`http://nuncupatively.blogspot.co.uk/2011/07/naive-bayes-in-sql.html`
+
+This isn't an efficient way to do it on small datasets, in fact it will be orders of magnitude slower than just loading the data into RAM in something like R, but it works for illustration purposes.
+
+(It also wouldn't scale very well as is, due to the use of the cross operator which is lethal on large data sets. Improvements to follow. Maybe.)
+
+Getting the files
+-----------------
+
+We'll be using the famous '20 Newsgroups' document classification dataset from Usenet. This contains posts from Usenet from several years ago. Thankfully someone has already gone to the trouble of tokenizing it all and decomposing it into sparse term-document matrices.
+
+Download the file 20news-bydate-matlab.tgz from here:
+
+    http://people.csail.mit.edu/jrennie/20Newsgroups/20news-bydate-matlab.tgz
+
+Decompress it and copy the contents into Hadoop.
+
+Preparation
+-----------
+
+    define Enumerate datafu.pig.bags.Enumerate('1');
+    
+    train_data = load 'train.data' using PigStorage(' ')
+        as (docID:long, wordID:long, count:long);
+
+    train_label = load 'train.label' using PigStorage()
+        as (label:long);
+
+    train_label_enum = foreach (group train_label all)
+        generate flatten(Enumerate($1)) as (label:long, docID:long);
+
+    train_join = join train_data by docID, train_label_enum by docID using 'replicated';
+
+    train_all = foreach train_join
+        generate train_data::docID as docID, wordID, count, label;
+
+    train_agg = foreach (group train_all by (docID, wordID, label))
+        generate flatten(group) as (docID, wordID, label),
+            SUM(train_all.count) as sum_count;
+
+
+
+    train_agg2 = foreach (group train_all by (wordID, label))
+        generate flatten(group) as (wordID, label),
+            COUNT($1) as num_inst;
+
+    labels = distinct train_label;
+
+    wordIDs = distinct (foreach train_data generate wordID);
+
+    priors = foreach (cross labels, wordIDs)
+        generate label as label, wordID as wordID, 0.5 as prior;
+
+    matrix = foreach
+        (join priors by (label, wordID) left, train_agg2 by (label, wordID))
+            generate priors::label as label, priors::wordID as wordID,
+                prior + num_inst as score;
+
+    class_sizes = foreach (group matrix by label)
+        generate group as label, SUM(matrix.score) as class_tot;
+
+    total_size = foreach (group class_sizes all)
+        generate SUM(class_sizes.class_tot) as tot;
+
+    word_counts = foreach (group matrix by wordID)
+        generate group as wordID, SUM(matrix.score) as word_tot;
+
+    join1 = join matrix by wordID, word_counts by wordID using 'replicated';
+
+    join2 = join join1 by matrix::label, class_sizes by label using 'replicated';
+
+    join3 = cross join2, total_size;
+
+    coeffs = foreach join3 {
+        coeff = LOG(matrix::score / (word_counts::word_tot - matrix::score))
+            - LOG(class_tot / (tot - class_tot));
+        generate matrix::label as label, matrix::wordID as wordID, coeff as coeff;
+    }
+
+
+
+    test_data = load 'test.data' using PigStorage(' ')
+        as (docID:long, wordID:long, count:long);
+
+    test_label = load 'test.label' using PigStorage()
+        as (label:long);
+
+    test_label_enum = foreach (group test_label all)
+        generate flatten(Enumerate($1)) as (label:long, docID:long);
+
+    test_join = join test_data by docID, test_label_enum by docID using 'replicated';
+
+    test_all = foreach test_join
+        generate test_data::docID as docID, wordID, count, label;
+
+    test_agg = foreach (group test_all by (docID, wordID, label))
+        generate flatten(group) as (docID, wordID, label),
+            SUM(test_all.count) as sum_count;
+
+
+
+    test_agg_joined = foreach(join test_agg by wordID, coeffs by wordID)
+        generate test_agg::wordID as wordID, test_agg::docID as docID,
+            coeffs::label as prediction,
+            coeffs::coeff as coeff;
+
+    test_scores = foreach (group test_agg_joined by (docID, prediction))
+        generate group.docID as docID, group.prediction as prediction,
+            SUM(test_agg_joined.coeff) as score;
+
+    test_predictions = foreach (group test_scores by docID) {
+        first = TOP(1, 2, test_scores); -- 2 == score
+        generate flatten(first) as (docID, prediction, score);
+    }
+
+    store test_predictions into 'test_predictions' using PigStorage();
+
+
+
+
+
+
+    tp2 = load 'test_predictions' using PigStorage as (docID:long, prediction:long, dummy);
+
+    matched = join test_label_enum by docID left, tp2 by docID using 'replicated';
+
+    label_scored = foreach matched generate test_label_enum::label,
+        (label == prediction ? 1 : 0) as match;
+
+    label_score_summary = foreach (group label_scored by label) {
+        instances = (float) COUNT(label_scored);
+        hits = (float) SUM(label_scored.match);
+        generate group as label, hits, instances, hits / instances as accuracy;
+    }
+
+    ng_map = load 'test.map' using PigStorage(' ')
+        as (newsgroup:chararray, ngID:long);
+
+    summary_with_names = join label_score_summary by label, ng_map by ngID using 'replicated';
+
+    dump summary_with_names;
 
 
