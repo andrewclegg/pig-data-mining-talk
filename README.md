@@ -38,7 +38,7 @@ Preparation
 
     set pig.exec.mapPartAgg true;
 
-    -- Enumrate iterates through a bag and gives each element an index number
+    -- Enumerate iterates through a bag and gives each element an index number
     
     define Enumerate datafu.pig.bags.Enumerate('1');
     
@@ -229,13 +229,5 @@ Songs A and C may not have many listeners in common, but there may be a third tr
 You can use two copies of the `song_pairs` relation, joined together, to look for cases like this.
 
 ### Example?
-
-Approximate methods
--------------------
-
-I called this a naive approach because past a certain point it'll start getting costly to scale.
-
-For very large data sets, you really need a way of partitioning the search space in such a way that you can do a local search for nearest neighbours instead of a global search. That is, you only need to compare each item to likely candidates for high similarity. 
-
 
 
